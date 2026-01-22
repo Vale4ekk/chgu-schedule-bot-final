@@ -11,21 +11,44 @@ from aiogram.filters import Command, Text
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Получаем токен и URL вебхука из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://your-bot.onrender.com")
+if not BOT_TOKEN:
+    raise ValueError("Не установлен BOT_TOKEN")
+
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://your-bot.onrender.com").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+PORT = int(os.getenv("PORT", 8000))
 
+# Конфигурация
 MY_SUBGROUP = 2
 SCHEDULE_URL = "https://tt.chuvsu.ru/index/grouptt/gr/7681"
 
-WEEKDAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
+# Все дни недели (включая воскресенье)
+WEEKDAYS_RU = [
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье"
+]
+
+# Кэш расписания: {'data': ..., 'updated_at': ...}
+schedule_cache: Dict[str, any] = {"data": None, "updated_at": None}
+CACHE_DURATION = timedelta(minutes=5)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
+# Клавиатура
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Завтра")],
@@ -42,6 +65,7 @@ def is_even_week() -> bool:
 def parse_schedule(html: str) -> Dict[str, List[str]]:
     soup = BeautifulSoup(html, "html.parser")
     days = {}
+    current_is_even = is_even_week()
 
     day_headers = soup.find_all("h3")
     for header in day_headers:
@@ -67,8 +91,14 @@ def parse_schedule(html: str) -> Dict[str, List[str]]:
             if not subject_cell or subject_cell == "—":
                 continue
 
+            # Проверяем, относится ли предмет к этой неделе
             is_even_marker = "**" in subject_cell
             is_odd_marker = "*" in subject_cell and not is_even_marker
+
+            if is_even_marker and not current_is_even:
+                continue
+            if is_odd_marker and current_is_even:
+                continue
 
             clean_text = subject_cell.replace("**", "").replace("*", "").strip()
             lines = [line.strip() for line in clean_text.split("\n") if line.strip()]
@@ -89,15 +119,26 @@ def parse_schedule(html: str) -> Dict[str, List[str]]:
 
     return days
 
-async def fetch_schedule() -> Optional[Dict[str, List[str]]]:
+async def get_cached_schedule() -> Optional[Dict[str, List[str]]]:
+    global schedule_cache
+    now = datetime.now()
+    if schedule_cache["data"] and schedule_cache["updated_at"]:
+        if now - schedule_cache["updated_at"] < CACHE_DURATION:
+            logger.info("Возвращаем расписание из кэша.")
+            return schedule_cache["data"]
+
+    logger.info("Обновляем расписание с сайта...")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
             resp = await client.get(SCHEDULE_URL, headers=headers)
             resp.raise_for_status()
-        return parse_schedule(resp.text)
+        parsed = parse_schedule(resp.text)
+        schedule_cache["data"] = parsed
+        schedule_cache["updated_at"] = now
+        return parsed
     except Exception as e:
-        logging.error(f"Ошибка загрузки расписания: {e}")
+        logger.error(f"Ошибка загрузки расписания: {e}")
         return None
 
 def format_day_schedule(day_name: str, lessons: List[str]) -> str:
@@ -115,7 +156,7 @@ async def start(message: Message):
 
 @router.message(Text("📅 Сегодня"))
 async def today(message: Message):
-    schedule = await fetch_schedule()
+    schedule = await get_cached_schedule()
     if schedule is None:
         await message.answer("❌ Не удалось загрузить расписание. Попробуй позже.")
         return
@@ -131,7 +172,7 @@ async def today(message: Message):
 
 @router.message(Text("📆 Завтра"))
 async def tomorrow(message: Message):
-    schedule = await fetch_schedule()
+    schedule = await get_cached_schedule()
     if schedule is None:
         await message.answer("❌ Не удалось загрузить расписание. Попробуй позже.")
         return
@@ -147,30 +188,31 @@ async def tomorrow(message: Message):
 
 @router.message(Text("🗓 Неделя"))
 async def week(message: Message):
-    schedule = await fetch_schedule()
+    schedule = await get_cached_schedule()
     if schedule is None:
         await message.answer("❌ Не удалось загрузить расписание. Попробуй позже.")
         return
 
     text = "📅 *Расписание на текущую неделю:*\n\n"
-    for day in WEEKDAYS_RU:
+    for day in WEEKDAYS_RU[:-1]:  # Без воскресенья
         lessons = schedule.get(day, [])
         text += format_day_schedule(day, lessons)
     await message.answer(text, parse_mode="Markdown")
 
 dp.include_router(router)
 
-async def on_startup(app: web.Application):
-    await bot.set_webhook(WEBHOOK_URL)
+async def on_startup(bot_instance: Bot):
+    await bot_instance.set_webhook(WEBHOOK_URL)
+    logger.info(f"Webhook установлен на {WEBHOOK_URL}")
 
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
+async def on_shutdown(bot_instance: Bot):
+    await bot_instance.delete_webhook()
+    logger.info("Webhook удален.")
 
 if __name__ == "__main__":
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_shutdown)
-    port = int(os.getenv("PORT", 8000))
-    web.run_app(app, host="0.0.0.0", port=port)
+    app.on_startup.append(lambda a: on_startup(bot))
+    app.on_cleanup.append(lambda a: on_shutdown(bot))
+    web.run_app(app, host="0.0.0.0", port=PORT)
