@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: chgu-schedule-bot
+    env: python
+    region: frankfurt
+    buildCommand: "pip install --no-cache-dir -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        fromVariable: BOT_TOKEN
+      - key: WEBHOOK_HOST
+        fromVariable: WEBHOOK_HOST
