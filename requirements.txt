@@ -1,4 +1,4 @@
-aiogram==3.6.0
-httpx
-beautifulsoup4
-html5lib
+aiogram==3.10.0
+httpx==0.27.0
+beautifulsoup4==4.12.3
+html5lib==1.1
